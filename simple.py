@@ -12,11 +12,13 @@ from nanovllm.engine.block_manager import BlockManager
 
 def main():
     # 1. 基础配置
+    # model_path = os.path.expanduser("/model/DeepSeek-R1-Distill-Qwen-1.5B/")
     model_path = os.path.expanduser("/model/Qwen2.5-3B-Instruct/")
 
-    prompt_file = "prompt.txt"    
-    with open(prompt_file, "r", encoding="utf-8") as f:
-        prompt_text = f.read().strip()
+    # prompt_file = "prompt_short.txt"    
+    # with open(prompt_file, "r", encoding="utf-8") as f:
+    #     prompt_text = f.read().strip()
+    prompt_text = "who you are."
 
     kwargs = {"tensor_parallel_size": 1, "enforce_eager": True}
     config_fields = {field.name for field in fields(Config)}
@@ -30,8 +32,17 @@ def main():
     block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
 
     # 3. 准备数据
-    prompt_tokens = tokenizer.encode(prompt_text)
-    sampling_params = SamplingParams(max_tokens=48)
+    messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Who are you?"}
+    ]
+
+    prompt_tokens = tokenizer.apply_chat_template(
+    messages,
+    tokenize=True,
+    add_generation_prompt=True
+    )
+    sampling_params = SamplingParams(max_tokens=1024)
     seq = Sequence(prompt_tokens, sampling_params)
     
     # 物理显存分配

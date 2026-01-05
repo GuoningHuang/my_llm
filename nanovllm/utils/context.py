@@ -9,9 +9,9 @@ class Context:
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
-    slot_mapping: torch.Tensor | None = None
-    context_lens: torch.Tensor | None = None
-    block_tables: torch.Tensor | None = None
+    slot_mapping: torch.Tensor | None = None # 每个产生的kv cache，要写到kv cache的第几个token的位置
+    context_lens: torch.Tensor | None = None # 每个 batch 中，“当前这条序列已经有多少个 token 在 KV cache 里
+    block_tables: torch.Tensor | None = None # 表示哪个seq的 kv cache在哪几个block里面存储
 
 _CONTEXT = Context()
 
