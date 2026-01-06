@@ -19,7 +19,7 @@ import time
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], memory_manager):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -28,7 +28,8 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if not dist.is_initialized():
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -45,7 +46,7 @@ class ModelRunner:
                     if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
                          self.model.lm_head.weight = self.model.model.embed_tokens.weight
 
-        self.memory_manager = MemoryManager(self.config, device="cuda")
+        self.memory_manager = memory_manager
 
         param_map = {} # 用于记录已分配的参数，处理权重共享(tie_weights)
         
@@ -75,10 +76,10 @@ class ModelRunner:
             print(f"Weights loaded in {end_load - start_load:.2f} seconds")
             
         self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
+        # self.warmup_model()
+        # self.allocate_kv_cache()
+        # if not self.enforce_eager:
+        #     self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -184,12 +185,23 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         
-        # 【修改点：调用 manager 初始化 KV 池】
-        # manager 会计算能放多少个 block，并打印内存报告
-        config.num_kvcache_blocks = self.memory_manager.init_kv_pool(block_bytes)
+        if self.memory_manager.kv_buffer is None:
+            # 尚未分配，我是第一个初始化的 Runner (或者唯一一个)
+            # manager 会计算能放多少个 block，并打印内存报告
+            config.num_kvcache_blocks = self.memory_manager.init_kv_pool(block_bytes)
+        else:
+            # 已经分配过了（说明这是第二个模型，或者被手动调用过）
+            # 直接根据现有的 buffer 大小计算我的 config 能分多少个 block
+            # 注意：这里假设所有模型复用同一块物理内存，且总是占满剩余显存
+            kv_buffer_size = len(self.memory_manager.kv_buffer)
+            config.num_kvcache_blocks = kv_buffer_size // block_bytes
+            print(f"Reuse KV Pool: {kv_buffer_size / 1024**3:.2f} GB available, assigned {config.num_kvcache_blocks} blocks to current model.")
         
         # 获取切分好的 KV 缓存 Buffer
         kv_storage = self.memory_manager.get_kv_buffer()
+
+        needed_bytes = config.num_kvcache_blocks * block_bytes
+        kv_storage = kv_storage[:needed_bytes]
         
         # View 成 KV Cache 的形状
         # 形状: [2, layers, blocks, block_size, kv_heads, head_dim]
