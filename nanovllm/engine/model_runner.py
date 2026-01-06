@@ -71,10 +71,8 @@ class ModelRunner:
             self._set_module_parameter(name, new_param)
             param_map[id(param)] = new_param
             offset += nbytes
-            
-        print(f"Model weights placed in memory pool. Used: {offset/1024**3:.2f} GB")
-        self.fix_buffers()
 
+        self.fix_buffers()
 
         start_load = time.perf_counter()
         load_model(self.model, config.model)
@@ -198,9 +196,6 @@ class ModelRunner:
         if config.num_kvcache_blocks <= 0:
              raise RuntimeError(f"没有足够的显存用于 KV Cache。剩余: {remaining_bytes/1024**2:.2f} MB")
         
-        if self.rank == 0:
-            print(f"KV Cache allocated: {config.num_kvcache_blocks} blocks ({config.num_kvcache_blocks * block_bytes / 1024**3:.2f} GB)")
-
         # 直接从 memory_pool 的剩余部分创建 KV Cache Tensor
         # 计算需要的字节总数
         total_kv_bytes = config.num_kvcache_blocks * block_bytes
@@ -223,6 +218,19 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+                pool_gb = self.pool_size / (1024**3)
+    
+        model_gb = start_offset / (1024**3)
+        kv_gb = total_kv_bytes / (1024**3)
+        leftover_mb = (self.pool_size - start_offset - total_kv_bytes) / (1024**2)
+        print(f"\n{'='*40}")
+        print(f"Memory Allocation Report (Rank 0)")
+        print(f"{'='*40}")
+        print(f"  Global Memory Pool : {pool_gb:.2f} GB")
+        print(f"  Model Weights      : {model_gb:.2f} GB")
+        print(f"  KV Cache           : {kv_gb:.2f} GB ({config.num_kvcache_blocks} blocks)")
+        print(f"  Unused/Fragmented  : {leftover_mb:.2f} MB")
+        print(f"{'='*40}\n")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

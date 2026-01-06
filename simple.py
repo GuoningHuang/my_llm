@@ -13,7 +13,7 @@ from nanovllm.engine.block_manager import BlockManager
 def main():
     # 1. 基础配置
     # model_path = os.path.expanduser("/model/DeepSeek-R1-Distill-Qwen-1.5B/")
-    model_path = os.path.expanduser("/model/Qwen2.5-3B-Instruct/")
+    model_path = os.path.expanduser("/model/Qwen2.5-0.5B-Instruct/")
 
     # prompt_file = "prompt_short.txt"    
     # with open(prompt_file, "r", encoding="utf-8") as f:
