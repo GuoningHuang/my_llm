@@ -1,5 +1,6 @@
 import pickle
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -10,6 +11,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.layers.rotary_embedding import RotaryEmbedding
 
 import time
 
@@ -29,18 +31,60 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+
+        with torch.device("meta"):
+            self.model = Qwen3ForCausalLM(hf_config)
+            if getattr(hf_config, "tie_word_embeddings", False):
+                if hasattr(self.model, "tie_weights"):
+                    self.model.tie_weights()
+                else:
+                    # 如果模型没有实现 tie_weights，手动绑定 (针对常见结构)
+                    # 注意：根据你的模型结构，路径可能是 self.model.model.embed_tokens
+                    if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
+                         self.model.lm_head.weight = self.model.model.embed_tokens.weight
+
+        _, total_gpu_memory = torch.cuda.mem_get_info()
+        self.pool_size = int(total_gpu_memory * config.gpu_memory_utilization)
+        self.memory_pool = torch.empty(self.pool_size, dtype=torch.uint8, device="cuda")
+        
+        offset = 0
+        param_map = {} # 用于记录已分配的参数，处理权重共享(tie_weights)
+        
+        for name, param in self.model.named_parameters(remove_duplicate=False):
+            if id(param) in param_map:
+                self._set_module_parameter(name, param_map[id(param)])
+                continue
+
+            numel = param.numel()
+            element_size = param.element_size()
+            nbytes = numel * element_size
+            
+            while offset % 256 != 0:
+                offset += 1
+            offset += nbytes
+            if offset + nbytes > self.pool_size:
+                raise RuntimeError(f"OOM: 模型权重需要更多显存。")
+            param_view = self.memory_pool[offset : offset + nbytes].view(param.dtype).view(param.shape)
+            new_param = nn.Parameter(param_view, requires_grad=param.requires_grad)
+            if hasattr(param, "weight_loader"):
+                new_param.weight_loader = param.weight_loader
+            self._set_module_parameter(name, new_param)
+            param_map[id(param)] = new_param
+            offset += nbytes
+            
+        print(f"Model weights placed in memory pool. Used: {offset/1024**3:.2f} GB")
+        self.fix_buffers()
+
 
         start_load = time.perf_counter()
         load_model(self.model, config.model)
         end_load = time.perf_counter()
         if self.rank == 0:
             print(f"Weights loaded in {end_load - start_load:.2f} seconds")
-
-
+            
         self.sampler = Sampler()
         self.warmup_model()
-        self.allocate_kv_cache()
+        self.allocate_kv_cache(start_offset=offset)
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -54,6 +98,39 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
+    def _set_module_parameter(self, param_name, new_param):
+        """
+        根据参数名称（如 'model.layers.0.self_attn.q_proj.weight'）
+        找到对应的模块，并替换其参数属性。
+        """
+        module = self.model
+        parts = param_name.split('.')
+        # 遍历找到父模块
+        for part in parts[:-1]:
+            module = getattr(module, part)
+        # 替换属性
+        setattr(module, parts[-1], new_param)
+
+    def fix_buffers(self):
+        """修复因为 Meta 初始化而丢失或未计算的 Buffers (主要是 RoPE)"""
+        hf_config = self.config.hf_config
+        # 获取 RoPE 配置
+        base = getattr(hf_config, "rope_theta", 10000.0)
+        max_position = getattr(hf_config, "max_position_embeddings", 4096)
+        
+        for module in self.model.modules():
+            if isinstance(module, RotaryEmbedding):
+                # 重新计算 cos/sin 缓存
+                head_size = module.head_size
+                inv_freq = 1.0 / (base**(torch.arange(0, head_size, 2, dtype=torch.float, device="cuda") / head_size))
+                t = torch.arange(max_position, dtype=torch.float, device="cuda")
+                freqs = torch.einsum("i,j -> ij", t, inv_freq)
+                cos = freqs.cos()
+                sin = freqs.sin()
+                cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
+                # 覆盖 buffer
+                module.cos_sin_cache = cache.to(dtype=hf_config.torch_dtype)
+
 
     def exit(self):
         if self.world_size > 1:
@@ -106,19 +183,40 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
-    def allocate_kv_cache(self):
+    def allocate_kv_cache(self,start_offset: int):
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # 剩余可用显存
+        remaining_bytes = self.pool_size - start_offset
+        
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        
+        config.num_kvcache_blocks = remaining_bytes // block_bytes
+        
+        if config.num_kvcache_blocks <= 0:
+             raise RuntimeError(f"没有足够的显存用于 KV Cache。剩余: {remaining_bytes/1024**2:.2f} MB")
+        
+        if self.rank == 0:
+            print(f"KV Cache allocated: {config.num_kvcache_blocks} blocks ({config.num_kvcache_blocks * block_bytes / 1024**3:.2f} GB)")
+
+        # 直接从 memory_pool 的剩余部分创建 KV Cache Tensor
+        # 计算需要的字节总数
+        total_kv_bytes = config.num_kvcache_blocks * block_bytes
+        kv_storage = self.memory_pool[start_offset : start_offset + total_kv_bytes]
+        
+        # View 成 KV Cache 的形状
+        # 形状: [2, layers, blocks, block_size, kv_heads, head_dim]
+        self.kv_cache = kv_storage.view(hf_config.torch_dtype).view(
+            2, 
+            hf_config.num_hidden_layers, 
+            config.num_kvcache_blocks, 
+            self.block_size, 
+            num_kv_heads, 
+            head_dim
+        )
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
