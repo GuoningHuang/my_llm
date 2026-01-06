@@ -13,6 +13,8 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.layers.rotary_embedding import RotaryEmbedding
 
+from nanovllm.engine.memory_manager import MemoryManager
+
 import time
 
 class ModelRunner:
@@ -43,11 +45,8 @@ class ModelRunner:
                     if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
                          self.model.lm_head.weight = self.model.model.embed_tokens.weight
 
-        _, total_gpu_memory = torch.cuda.mem_get_info()
-        self.pool_size = int(total_gpu_memory * config.gpu_memory_utilization)
-        self.memory_pool = torch.empty(self.pool_size, dtype=torch.uint8, device="cuda")
-        
-        offset = 0
+        self.memory_manager = MemoryManager(self.config, device="cuda")
+
         param_map = {} # 用于记录已分配的参数，处理权重共享(tie_weights)
         
         for name, param in self.model.named_parameters(remove_duplicate=False):
@@ -59,18 +58,13 @@ class ModelRunner:
             element_size = param.element_size()
             nbytes = numel * element_size
             
-            while offset % 256 != 0:
-                offset += 1
-            offset += nbytes
-            if offset + nbytes > self.pool_size:
-                raise RuntimeError(f"OOM: 模型权重需要更多显存。")
-            param_view = self.memory_pool[offset : offset + nbytes].view(param.dtype).view(param.shape)
+            raw_ptr = self.memory_manager.allocate_weights(nbytes)
+            param_view = raw_ptr.view(param.dtype).view(param.shape)
             new_param = nn.Parameter(param_view, requires_grad=param.requires_grad)
             if hasattr(param, "weight_loader"):
                 new_param.weight_loader = param.weight_loader
             self._set_module_parameter(name, new_param)
             param_map[id(param)] = new_param
-            offset += nbytes
 
         self.fix_buffers()
 
@@ -82,7 +76,7 @@ class ModelRunner:
             
         self.sampler = Sampler()
         self.warmup_model()
-        self.allocate_kv_cache(start_offset=offset)
+        self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -181,25 +175,21 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
-    def allocate_kv_cache(self,start_offset: int):
+    def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        # 剩余可用显存
-        remaining_bytes = self.pool_size - start_offset
         
+        # 计算单个 Block 的大小 (字节)
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         
-        config.num_kvcache_blocks = remaining_bytes // block_bytes
+        # 【修改点：调用 manager 初始化 KV 池】
+        # manager 会计算能放多少个 block，并打印内存报告
+        config.num_kvcache_blocks = self.memory_manager.init_kv_pool(block_bytes)
         
-        if config.num_kvcache_blocks <= 0:
-             raise RuntimeError(f"没有足够的显存用于 KV Cache。剩余: {remaining_bytes/1024**2:.2f} MB")
-        
-        # 直接从 memory_pool 的剩余部分创建 KV Cache Tensor
-        # 计算需要的字节总数
-        total_kv_bytes = config.num_kvcache_blocks * block_bytes
-        kv_storage = self.memory_pool[start_offset : start_offset + total_kv_bytes]
+        # 获取切分好的 KV 缓存 Buffer
+        kv_storage = self.memory_manager.get_kv_buffer()
         
         # View 成 KV Cache 的形状
         # 形状: [2, layers, blocks, block_size, kv_heads, head_dim]
@@ -218,19 +208,6 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
-                pool_gb = self.pool_size / (1024**3)
-    
-        model_gb = start_offset / (1024**3)
-        kv_gb = total_kv_bytes / (1024**3)
-        leftover_mb = (self.pool_size - start_offset - total_kv_bytes) / (1024**2)
-        print(f"\n{'='*40}")
-        print(f"Memory Allocation Report (Rank 0)")
-        print(f"{'='*40}")
-        print(f"  Global Memory Pool : {pool_gb:.2f} GB")
-        print(f"  Model Weights      : {model_gb:.2f} GB")
-        print(f"  KV Cache           : {kv_gb:.2f} GB ({config.num_kvcache_blocks} blocks)")
-        print(f"  Unused/Fragmented  : {leftover_mb:.2f} MB")
-        print(f"{'='*40}\n")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
